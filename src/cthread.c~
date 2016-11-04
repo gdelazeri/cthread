@@ -1,0 +1,407 @@
+/*	BIBLIOTECA DE THREADS cthread
+
+	INSTITUTO DE INFORMÁTICA - UFRGS
+	Implementação do Trabalho Prático 1 
+	da disciplina de Sistemas Operacionais IN
+	
+	Autores:	Átila R. Costa
+				Guilherme Delazeri
+*/
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <ucontext.h>
+#include "../include/cdata.h"
+#include "../include/support.h"
+#include "../include/cthread.h"
+#define TAM_MEM 4096
+
+/*--Prototipos das funções auxiliares---------------*/
+TCB_t* searchNearest(int ticket);
+TCB_t* searchTID(PFILA2 pFila, int tid);
+int SILVESTER_ESCALONE();
+int deleteNode(PFILA2 fila, TCB_t *tcb);
+int dispatcher(TCB_t* toEXEC);
+int clearBlocked(int tidJ);
+int searchJoin(int tid);
+
+
+/*--Variáveis globais de controle-------------------*/
+int lockReturn = 0;
+int tid=0;
+
+/*--Variáveis e Ponteiros das Filas-----------------*/
+FILA2 filaAptos;
+PFILA2 APTO=&filaAptos;
+FILA2 filaBlock;
+PFILA2 BLOCK=&filaBlock;
+FILA2 filaJoins;
+PFILA2 W_JOIN=&filaJoins;
+
+/*--Ponteiro para o TCB que está executando----------*/
+TCB_t* EXEC;
+
+/*--Variável ucontext_t para o endereço de retorno---*/
+ucontext_t returncontext;
+
+
+
+/*********PRIMITIVAS DA BIBLIOTECA cthread.h*********/
+
+int ccreate (void* (*start)(void*), void *arg){
+
+	/*tid=0 é o tid da thred main, logo temos que criar o TCB da main
+    e setar seu contexto. Isso ocorre na primeira chamada de ccreate.*/
+    if(tid == 0){
+
+        if(CreateFila2(APTO))
+			return -1;
+		if(CreateFila2(BLOCK))
+			return -1;
+        if(CreateFila2(W_JOIN))
+			return -1;
+
+		//Aloca um TCB pra main
+        TCB_t* main_tcb = (TCB_t*) malloc (sizeof(TCB_t));
+
+        //inicializa TCB da main
+        main_tcb->ticket = (Random2() % 256);
+        main_tcb->state = PROCST_EXEC;
+        main_tcb->tid = tid;
+	getcontext(&(main_tcb->context));
+
+		//Colocar a main no estado de Execução
+        EXEC = main_tcb;
+
+		//getcontext no contexto para onde toda thread deve ir
+		//quando terminar sua execução
+        if(getcontext(&returncontext) == -1)
+			return -1;
+        if (lockReturn == 1)
+		{
+			//Verifica se tem alguém bloqueado e esperando
+			//pelo término da thread que acabou de executar
+            clearBlocked(EXEC->tid);
+	    	//readFila(BLOCK);
+            EXEC->state = PROCST_TERMINO;
+
+            //VERIFICAR SE CHEGOU AO FIM DA MAIN PARA DESALOCAR FILAS/SEMAFOROS
+
+            SILVESTER_ESCALONE();
+			return 0;
+        }
+        lockReturn = 1;
+    }
+
+	tid+=1;
+	//Aloca memória para um novo TCB
+    TCB_t* novo_tcb = (TCB_t*) malloc (sizeof(TCB_t));
+
+	//inicializa TCB
+	novo_tcb->ticket = (Random2() % 256);
+	novo_tcb->state = PROCST_APTO;
+	novo_tcb->tid = tid;
+	if (getcontext(&novo_tcb->context) == -1)
+	    return -1;
+
+	//Inicializa contexto
+	(novo_tcb->context).uc_link = &returncontext;
+	(novo_tcb->context).uc_stack.ss_sp = malloc (TAM_MEM * sizeof(char));
+	(novo_tcb->context).uc_stack.ss_size = TAM_MEM;
+	makecontext(&(novo_tcb->context), (void(*)())start,1,arg);
+
+	//insere o TCB na fila de APTOS
+	if (AppendFila2(APTO, novo_tcb))
+	    return -1;
+
+	return tid;
+};
+
+int cyield(void){
+	EXEC->state = PROCST_APTO;
+	if(AppendFila2(APTO, EXEC))
+        return -1;
+	SILVESTER_ESCALONE();
+
+    return 0;
+}
+
+int cjoin(int tid){
+	//Se a thread não existe
+	if((searchTID(APTO, tid) == NULL) && (searchTID(BLOCK, tid) == NULL))
+		return -1;
+
+    //Se a thread ja esta sendo esperada por alguém
+	if(searchJoin(tid))
+		return -1;
+
+    /*Aloca uma nova struct para guardar o tid da thread
+    que está sendo bloqueada e o tid da thread que está sendo aguardada*/
+    wJoin_t* JoinS = (wJoin_t*) malloc (sizeof(wJoin_t));
+	JoinS->tidBlocked = EXEC->tid;
+	JoinS->tidJoin = tid;
+	if(AppendFila2(W_JOIN,JoinS))
+        return -1;
+
+	EXEC->state = PROCST_BLOQ;
+
+	SILVESTER_ESCALONE();
+	return 0;
+};
+
+int csem_init (csem_t *sem, int count){
+	//Aloca fila do semáforo
+    PFILA2 semFila = (PFILA2)malloc(sizeof(FILA2));
+
+    if(CreateFila2(semFila))
+        return -1;
+
+	//Inicializa o semáforo
+    sem->fila = semFila;
+    sem->count = count;
+
+    return 0;
+};
+
+int cwait (csem_t *sem){
+	
+    sem->count -= 1;
+
+	//Coloca em bloqueado se o recurso não está disponível
+    if(sem->count < 0){
+        EXEC->state = PROCST_BLOQ;
+        if(AppendFila2(sem->fila,EXEC))
+            return -1;
+
+        SILVESTER_ESCALONE();
+    }
+    return 0;
+}
+
+int csignal (csem_t *sem){
+
+	sem->count += 1;
+
+	//Coloca o primeiro TCB da fila para APTO
+    if(sem->count <= 0){
+
+        if(FirstFila2(sem->fila))
+            return -1;
+
+        TCB_t* aux=GetAtIteratorFila2(sem->fila);
+
+        aux->state = PROCST_APTO;
+	    if(AppendFila2(APTO, aux))
+            return -1;
+	    if(deleteNode(BLOCK, aux))
+            return -1;
+        if(DeleteAtIteratorFila2(sem->fila))
+            return -1;
+    }
+
+    return 0;
+}
+
+int cidentify(char* name, int size){
+   char nameP[] = "Atila R. Costa Silva 261574\n Guilherme Delazeri 261584\n\n";
+   int i = 0;
+
+   if(!name)
+	 	return -1;
+
+   for(i = 0; i < size; i++)
+   {
+	if(nameP[i] != '\0')
+     {
+         name[i] = nameP[i];
+     }
+     else
+     {
+       name[i] = '\0';
+       break;
+     }
+   }
+   return 0;
+}
+
+
+/******FUNÇÕES AUXILIARES DA BIBLIOTECA cthread.h******/
+
+int clearBlocked(int tidJ)
+{	/*Retorna 0 se retirou alguém da fila de blocked for join, -1 se não.*/
+    wJoin_t* join;
+    TCB_t* tcb_aux;
+
+    if (FirstFila2(W_JOIN))
+        return -1;
+
+	/*Procura pelo tidJ (tid do TCB que está sendo esperado)
+	para verificar se tem alguém bloqueado por ele*/
+    while((join=GetAtIteratorFila2(W_JOIN)) != NULL)
+	{
+        if(join->tidJoin == tidJ)
+		{	//Se tiver na fila, coloca o que estava bloqueado para apto
+            tcb_aux = searchTID(BLOCK,join->tidBlocked);
+            tcb_aux->state = PROCST_APTO;
+
+            if(AppendFila2(APTO, tcb_aux))
+			    return -1;
+            if(deleteNode(BLOCK, tcb_aux))
+                return -1;
+            if(DeleteAtIteratorFila2(W_JOIN))
+                return -1;
+
+            return 0;
+        }
+        else
+            if (NextFila2(W_JOIN))
+                return -1;
+    }
+	return -1;
+}
+
+
+int searchJoin(int tid)
+{   /*Retorna -1 se tid está bloqueando alguem, 0 se não está*/
+    wJoin_t* join;
+
+     if (FirstFila2(W_JOIN))
+        return 0;
+
+    while((join=GetAtIteratorFila2(W_JOIN)) != NULL){
+        if(join->tidJoin == tid)
+            return -1;
+        else
+            if (NextFila2(W_JOIN))
+                return 0;
+    }
+ return -1;
+}
+
+int deleteNode(PFILA2 fila, TCB_t *tcb)
+{	/*Retorna 0 se deleta corretamente o TCB de fila, -1 se houve erro*/
+	TCB_t* tcb_aux;
+
+	if(FirstFila2(fila))
+		return -1;
+
+	while((tcb_aux=GetAtIteratorFila2(fila)))
+	{
+		if(tcb_aux->tid == tcb->tid){
+			if(DeleteAtIteratorFila2(fila))
+                return -1;
+			else
+                return 0;
+		}
+		else
+			if(NextFila2(fila))
+				return -1;
+	}
+	return -1;
+}
+
+
+
+int SILVESTER_ESCALONE()
+{
+	//Sorteia um numero entre 0 e 255
+    int sorteio = (Random2() % 256);
+	printf("%d\n",sorteio);
+	TCB_t* toEXEC = searchNearest(sorteio);
+	printf("%d\n",toEXEC->tid);
+    if(toEXEC == NULL){
+        printf("\nERROR: Fila de APTOS está vazia!\n");
+        return -1;
+    }
+	
+	//Chama os dispatcher para fazer as trocas de contexto
+    dispatcher(toEXEC);
+
+    return 0;
+}
+
+int dispatcher(TCB_t* toEXEC){
+/*Retorna 0 se ocorreu corretamente, -1 se houve um erro*/
+
+	int x;
+	x = EXEC->state;
+    switch(x){
+        case PROCST_APTO:
+            break;
+        case PROCST_BLOQ:
+			//EXEC vai para Bloqueado
+			if(AppendFila2(BLOCK, EXEC))
+				return -1;
+            break;
+        case PROCST_TERMINO:
+            free(EXEC);     //Desaloca o TCB
+            EXEC=NULL;
+     	    toEXEC->state = PROCST_EXEC;
+	        EXEC = toEXEC;
+	        if(deleteNode(APTO, toEXEC))
+                return -1;
+            setcontext(&(EXEC->context));
+            break;
+        default:
+            return -1;
+    }
+	toEXEC->state = PROCST_EXEC;
+	TCB_t* auxEXEC = EXEC;
+    EXEC = toEXEC;
+
+	if(deleteNode(APTO, toEXEC))
+        return -1;
+
+	//Salva o contexto atual e vai para o contexto escolhido
+    swapcontext(&(auxEXEC->context),&(EXEC->context));
+    return 0;
+}
+
+TCB_t* searchNearest(int ticket) { 
+	TCB_t* tcb; 
+	TCB_t* tcb_aux; 
+	int aux_dif = -1; 
+	
+	if(FirstFila2(APTO)) 
+		return NULL; 
+
+	tcb=GetAtIteratorFila2(APTO); 
+	tcb_aux=tcb; 
+	aux_dif = abs(tcb->ticket - ticket); 
+	
+	if (NextFila2(APTO)) 
+		return tcb; 
+	
+	while((tcb=GetAtIteratorFila2(APTO)) != NULL)
+	{ 
+		if((abs(tcb->ticket - ticket) == aux_dif)) 
+			if((tcb->tid) > (tcb_aux->tid)) 
+				tcb_aux = tcb; 
+		if((abs(tcb->ticket - ticket) < aux_dif)) 
+		{ 
+			tcb_aux = tcb; 
+			aux_dif = abs(tcb->ticket - ticket); 
+		}
+		 else if (NextFila2(APTO))
+		 			return tcb_aux;
+	} 
+	return tcb_aux; 
+}
+
+TCB_t* searchTID(PFILA2 pFila, int tid)
+{   /*Retorna um ponteiro do TCB que contém "tid"*/
+    TCB_t* tcb;
+
+    if (FirstFila2(pFila))
+        return NULL;
+
+    while((tcb=GetAtIteratorFila2(pFila)) != NULL){
+        if(tcb->tid == tid)
+            return tcb;
+        else
+            if (NextFila2(pFila))
+                return NULL;
+    }
+	return NULL;
+}
+

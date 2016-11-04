@@ -1,0 +1,326 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <ucontext.h>
+#include "../include/cdata.h"
+#include "../include/support.h"
+#include "../include/cthread.h"
+
+
+#define TAM_MEM 4096
+
+int tid;
+PFILA2* APTO;
+PFILA2* BLOCK;
+PFILA2* W_JOIN;
+TCB_t* EXEC;
+//u_context return_context;
+TCB_t* searchNearest(int ticket);
+TCB_t* searchTID(PFILA2 pFila, int tid);
+/*
+typedef struct s_sem {
+	int count; // indica se recurso está ocupado ou não (livre > 0, ocupado ≤ 0)
+	PFILA2 fila; // ponteiro para uma fila de threads bloqueadas no semáforo
+} csem_t;
+
+struct	sFilaNode2 {
+	void 	*node;			// Ponteiro para a estrutura de dados do NODO
+	struct	sFilaNode2 *ant;	// Ponteiro para o nodo anterior
+	struct	sFilaNode2 *next;	// Ponteiro para o nodo posterior
+};
+typedef struct sFilaNode2	NODE2;
+
+
+typedef struct s_TCB {
+	int		tid; 		// identificador da thread
+	int		state;		// estado em que a thread se encontra
+					// 0: Cria��o; 1: Apto; 2: Execu��o; 3: Bloqueado e 4: T�rmino
+        int		ticket;		// 0-255: bilhete de loteria da thread
+	ucontext_t 	context;	// contexto de execu��o da thread (SP, PC, GPRs e recursos)
+} TCB_t;
+
+*/
+
+typedef struct wJoin {
+	int tidBlocked; // indica o tid que se bloqueou para esperar tidJoin
+	int tidJoin;    // indica o tid que foi esperado por tidBlocked
+} wJoin;
+
+
+void clearBlocked(tidJ)
+{
+    wJoin* join;
+    TCB_t* tcb_aux;
+
+    if (FirstFila2(*W_JOIN))
+        return;
+
+    while((join=GetAtIteratorFila2(*W_JOIN)) != NULL){
+        if(join->tidJoin == tidJ){
+            tcb_aux = searchTID(BLOCK,join->tidBlocked);
+            tcb_aux->state = 1;
+            moveNode(BLOCK, APTO, tcb_aux);
+            DeleteAtIteratorFila2(*W_JOIN);
+            return;
+        }
+        else
+            if (NextFila2(*W_JOIN))
+                return;
+    }
+}
+
+
+int searchJoin(tid)
+{   //Retorna 1 se tid está bloquando alguem, 0 se não
+    wJoin* join;
+    
+     if (FirstFila2(*W_JOIN))
+        return 0;
+        
+    while((join=GetAtIteratorFila2(*W_JOIN)) != NULL){
+        if(join->tidJoin == tid)
+            return 1;
+        else
+            if (NextFila2(*W_JOIN))
+                return 0;
+    }
+}
+
+
+
+/*
+
+int ccreate (void* (*start)(void*), void *arg){
+
+    //MODIFICAR PARA O RETORNO DA FUNÇAO (uc_link)
+    if(tid == 0){
+
+
+        int lockReturn = 0;
+        CreateFila2(APTO);
+        CreateFila2(BLOCK);
+        CreateFila2(W_JOIN);
+        TCB_t* main_tcb = (TCB_t*) malloc (sizeof(TCB_t));
+
+        //inicializar TCB
+        main_tcb->ticket = random2();
+        main_tcb->state = 1;
+        main_tcb->tid = tid;
+        tid += 1;
+        EXEC = main_tcb;
+
+        getcontext(&returncontext);
+        if (lockReturn == 1){
+            clearBlocked(EXEC->tid);
+            EXEC->state = 4;
+            SILVESTER_ESCALONE()
+        }
+        lockReturn = 1;
+
+    }
+
+	//malloc em TCB
+    TCB_t* novo_tcb = (TCB_t*) malloc (sizeof(TCB_t));
+
+	//inicializar TCB
+	novo_tcb->ticket = random2();
+	novo_tcb->state = 1;
+	novo_tcb->tid = tid;
+	tid += 1;
+	if (getcontext(&novo_tcb->context) == -1)
+	    return -1;
+	(novo_tcb->context).uc_link = &return_context;
+	(novo_tcb->context).uc_stack.ss_sp = malloc (TAM_MEM * sizeof(char));
+	(novo_tcb->context).uc_stack.ss_size = TAM_MEM;
+	makecontext(&(novo_tcb->context), (void(*)())start,arg);
+
+	//inserir na fila de APTOS
+	if (!AppendFila2(APTO, novo_tcb))
+	    return -1;
+
+	return tid;
+};
+
+*/
+
+/*
+
+int cjoin(int tid){
+	TCB_t *join_node = searchTID(APTO, tid);
+	//se existe
+	if(join_node == NULL)
+		return -1;
+	//se a thread ja esta sendo esperada por alguem
+	if(searchJoin(W_JOIN,tid))
+		return -1;
+
+    wJoin* JoinS = (wJoin*) malloc (sizeof(wJoin));
+	JoinS->tidBlocked = EXEC->tid;
+	JoinS->tidJoin = tid;
+	Appendfila2(W_JOIN,JoinS);
+	
+	
+	EXEC->state = 3;
+
+
+	SILVESTER_ESCALONE();
+	return 0;
+};
+*/
+
+void SILVESTER_ESCALONE()
+{
+    int sorteio = random2();
+    TCB_t* toEXEC = searchNearest(sorteio);
+    dispatcher(toEXEC);
+    return;
+}
+
+
+int dispatcher(TCB_t* toEXEC){
+    TCB_t auxEXEC = *EXEC;
+    toEXEC->state = 2;
+    switch(EXEC->state){
+        case 1:
+            AppendFila2(APTO, EXEC);
+            break;
+        case 3:
+            AppendFila2(BLOCK, EXEC);
+            break;
+        case 4:
+            free(EXEC);     //Desaloca o TCB
+            EXEC=NULL;
+            //DES_malloc(EXEC);
+            moveNode(APTO,NULL,toEXEC);
+            setcontext(&(EXEC->context));
+            break;
+        default:
+            return -1;
+    }
+    moveNode(APTO,NULL,toEXEC);
+    swapcontext(&(auxEXEC.context),&(EXEC->context));
+    return 0;
+}
+
+
+TCB_t* searchNearest(int ticket)
+{
+    TCB_t* tcb;
+    TCB_t* tcb_aux;
+    int aux_dif = -1;
+    if (FirstFila2(*APTO))
+        return NULL;
+
+    while((tcb=GetAtIteratorFila2(*APTO)) != NULL)
+        if((abs(tcb->ticket - ticket) < aux_dif) || aux_dif < 0)
+        {
+            tcb_aux = tcb;
+            aux_dif = abs(tcb->ticket - ticket);
+        }
+        else
+            if (NextFila2(*APTO))
+                return tcb_aux;
+}
+
+/*
+int cyield(void){
+	EXEC->state = 1;
+	SILVESTER_ESCALONE();
+	return 0;
+}
+*/
+
+
+int moveNode(PFILA2 origem, PFILA2 destino, TCB_t *tcb)
+{//int state = Estado destino
+//tcb = TCB a ser inserido em destino ou em Exec
+    TCB_t* tcb_aux;
+    if (destino == NULL)
+    {//Tira o tcb da origem e coloca em Exec
+        if (FirstFila2(origem) != 0)
+            return -1;
+
+        while(GetAtIteratorFila2(origem)!=NULL)
+	    tcb_aux = GetAtIteratorFila2(origem);
+            if(tcb_aux->tid == tcb->tid){
+                DeleteAtIteratorFila2(origem);
+            }
+            else
+                if (NextFila2(origem)!=0)
+                    return -1;
+
+        EXEC = tcb;
+        return 0;
+    }
+    else
+    {//Tira da fila origem e insere na fila destino
+        if (FirstFila2(origem) != 0)
+            return -1;
+
+        while(GetAtIteratorFila2(origem)!=NULL){
+            tcb_aux = GetAtIteratorFila2(origem);
+            if(tcb_aux->tid == tcb->tid){
+                DeleteAtIteratorFila2(origem);
+                if(AppendFila2(destino,tcb) != 0)
+                    return -1;
+                return 0;
+            }
+            else
+                if (NextFila2(origem)!=0)
+                    return -1;
+        }
+    }
+};
+
+TCB_t* searchTID(PFILA2 pFila, int tid)
+{   //Retorna um ponteiro do tcb que contém "tid"
+    TCB_t* tcb;
+
+    if (FirstFila2(pFila))
+        return NULL;
+
+    while((tcb=GetAtIteratorFila2(pFila)) != NULL){
+        if(tcb->tid == tid)
+            return tcb;
+        else
+            if (NextFila2(pFila))
+                return NULL;
+    }
+	return NULL;
+}
+
+
+
+/*
+int cwait (csem_t *sem){
+    sem->count -= 1;
+    if(sem->count < 0){
+        EXEC->state = 3;
+        appendFila2(sem->fila,EXEC);
+        SILVESTER_ESCALONE();
+    }
+    return 0;
+}
+
+
+ int csem_init (csem_t *sem, int count){
+    PFILA2* semFila;
+    CreateFila2(semFila);
+    sem->fila = semFila;
+    sem->count = count;
+    
+    return 0;
+ };
+
+ int csignal (csem_t *sem){
+    sem->count += 1;
+    if(sem->count <= 0){
+        FirstFila2(sem->fila);
+        s_TCB* aux=GetAtIterador(sem->fila);
+        aux->state = 1;
+        moveNode(BLOCK, APTO, aux);
+        DeleteAtIterador2(sem->aux);
+    }
+    return 0;
+}
+*/
+
