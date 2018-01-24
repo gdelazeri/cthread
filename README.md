@@ -1,5 +1,5 @@
 # cthread
-Implementation of cthread.h
+cthread.h (compact thread) implementation
 
 It's a library to use threads with these primitives:
   - ccreate;
